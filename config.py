@@ -35,7 +35,7 @@ TRADING_PAIRS: List[str] = [
     "BTC/USD",      # Store of Value anchor
     "XRP/USD",      # Payments — lowest BTC correlation (~0.55) among majors
     "BNB/USD",      # Exchange revenue — fee burn economics, not speculation
-    "TRX/USD",      # Stablecoin volume driver — USDT ecosystem revenue
+    "TRX/USD",      # Stablecoin volume driver — USDT ecosystem revenue (0.19 cross-corr, best diversifier)
     "LINK/USD",     # Oracle monopoly — data feeds, independent catalyst
     "FET/USD",      # AI agent narrative — decouples on AI news cycles
     "TAO/USD",      # AI compute market — orthogonal to financial crypto
@@ -58,7 +58,7 @@ SECTOR_MAP: Dict[str, str] = {
     "BTC":  "Store of Value",
     "XRP":  "Payments",
     "BNB":  "Exchange Token",
-    "TRX":  "Exchange Token",
+    "TRX":  "Stablecoin Infra",   # lowest correlation (0.19) — own sector to avoid cap limits
     "LINK": "Infrastructure",
     "FET":  "AI",
     "TAO":  "AI",
@@ -114,11 +114,26 @@ class RiskParams:
     vol_scale_cap: float = 1.0                  # NEVER lever up — only delever
     ewma_cov_alpha: float = 0.4                 # higher reactivity to recent vol changes
 
+    # ── TRX Fixed Allocation ──
+    trx_fixed_weight: float = 0.0            # disabled — using alpha bonus instead
+
     # ── ATR-Based Dynamic Stop-Losses ──
     atr_stop_multiplier: float = 2.5            # k × realized_vol = stop distance
     atr_lookback_hours: int = 24                # lookback for realized vol estimate
     atr_stop_floor: float = 0.05                # 5% minimum stop distance
     atr_stop_ceiling: float = 0.20              # 20% maximum stop distance
+
+    # ── Intra-Rebalance Stop-Loss ──
+    intra_stop_loss_pct: float = 0.04            # 4% drop from entry price triggers immediate sell
+    intra_stop_enabled: bool = True             # check every hour, not just at rebalance
+
+    # ── 5DMA Profit Protection ──
+    sma_profit_protect_enabled: bool = True     # sell holdings that break below 5DMA
+    sma_profit_protect_hours: int = 120         # 5 days * 24 hours
+    sma_addon_enabled: bool = False             # buy 20% more on 5DMA crossover (disabled)
+    sma_early_exit_enabled: bool = True         # sell 20% when price breaks below 3DMA
+    sma_early_exit_hours: int = 72              # 3 days * 24 hours
+    sma_early_exit_pct: float = 0.20            # sell 20% of position on 3DMA break
 
 
 @dataclass
@@ -150,13 +165,43 @@ class SignalParams:
     trend_filter: bool = True
     trend_filter_ma: int = 168          # 7-day SMA as trend filter
 
+    # Diversification bonus: TRX has 0.19 avg cross-corr (best diversifier in universe)
+    trx_diversification_bonus: float = 0.5  # added to raw alpha before z-scoring
+
+    # 5DMA momentum overlay: boost coins above 5DMA, penalize below
+    sma_5d_boost: float = 0.0              # disabled — sell-below-5DMA exit is sufficient
+
 
 @dataclass
 class RebalanceConfig:
-    frequency_hours: int = 2            # rebalance every 2 hours (best risk-adj composite)
+    frequency_hours: int = 2            # legacy cadence for comparisons/backward compatibility
+    continuous_on_hour_bar: bool = True # live loop runs continuously, executes once per closed 1h bar
+    poll_seconds: int = 60              # loop wake-up interval for event checks
     min_trade_value_usd: float = 50.0   # minimum trade size (reduce noise trades)
     min_weight_change: float = 0.03     # don't trade if weight change < 3%
     max_turnover_pct: float = 0.40      # max 40% turnover per rebalance
+
+
+@dataclass
+class OutlierOverrideConfig:
+    enabled: bool = True
+    cooldown_hours: int = 24
+
+    # Outlier trigger threshold in z-scored alpha space.
+    alpha_z_threshold: float = 2.0
+
+    # Require multiple signals to agree with the outlier direction.
+    min_signal_consensus: int = 3
+
+    # Risk-vs-reward gate: reward quality must exceed risk pressure.
+    min_reward_risk_ratio: float = 1.15
+
+    # Hard risk brakes for bullish cooldown breaks.
+    max_drawdown_for_bull_override: float = 0.12
+    max_corr_for_bull_override: float = 0.80
+
+    # During crash-like correlation, bearish overrides remain allowed.
+    allow_bear_override_in_corr_spike: bool = True
 
 
 @dataclass
@@ -194,4 +239,5 @@ CONSTRAINTS = PortfolioConstraints()
 RISK = RiskParams()
 SIGNALS = SignalParams()
 REBALANCE = RebalanceConfig()
+OUTLIER = OutlierOverrideConfig()
 CRISIS_MODE = CrisisModeConfig()

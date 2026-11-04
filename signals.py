@@ -794,6 +794,25 @@ class AlphaEngine:
             else:
                 alpha[below_trend] *= 0.1
 
+        # Diversification bonus: TRX has 0.19 avg cross-correlation (best diversifier)
+        # Give it a persistent alpha boost so the optimizer always considers it
+        if "TRX" in alpha.index:
+            alpha["TRX"] += cfg.SIGNALS.trx_diversification_bonus
+
+        # 5DMA momentum overlay: boost coins above 5DMA, penalize those below
+        sma_5d_window = cfg.RISK.sma_profit_protect_hours  # 120h
+        if len(prices) >= sma_5d_window:
+            sma_5d = prices.iloc[-sma_5d_window:].mean()
+            current = prices.iloc[-1]
+            for coin in alpha.index:
+                if coin in current.index and coin in sma_5d.index:
+                    if current[coin] > sma_5d[coin]:
+                        # Above 5DMA: trending — boost alpha
+                        alpha[coin] += cfg.SIGNALS.sma_5d_boost
+                    else:
+                        # Below 5DMA: weakening — penalize
+                        alpha[coin] -= cfg.SIGNALS.sma_5d_boost
+
         # Final z-score
         alpha = zscore(alpha)
         return alpha
@@ -811,3 +830,8 @@ class AlphaEngine:
     def adaptive_diagnostics(self) -> Dict:
         """Get adaptive weight diagnostics."""
         return self.signal_weighter.get_diagnostics()
+
+    @property
+    def last_signal_scores(self) -> Dict[str, pd.Series]:
+        """Return most recent raw component signal outputs by signal name."""
+        return self._prev_signal_scores if self._prev_signal_scores is not None else {}

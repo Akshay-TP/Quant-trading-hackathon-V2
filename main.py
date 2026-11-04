@@ -25,7 +25,7 @@ import signal
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -39,6 +39,89 @@ from executor import TradeExecutor, TradeOrder
 from risk_manager import RiskManager
 
 logger = logging.getLogger(__name__)
+
+
+class RoostooSpecClient(RoostooClient):
+    """Roostoo client adapter that normalizes README2 API response shapes.
+
+    README2 defines ticker payloads under "Data" and trade payloads under
+    "OrderDetail". The bot/executor pipeline expects flatter dicts, so this
+    adapter bridges those formats without changing trading logic.
+    """
+
+    def ticker(self, pair: str = None) -> Dict[str, Dict[str, Any]]:
+        """Return ticker map keyed by pair, regardless of raw response shape."""
+        raw = super().ticker(pair=pair)
+        if not isinstance(raw, dict):
+            return {}
+
+        if "Data" in raw and isinstance(raw["Data"], dict):
+            return raw["Data"]
+
+        # Fallback for non-wrapped payloads.
+        return raw
+
+    def get_all_prices(self) -> Dict[str, float]:
+        """Get latest prices from ticker map with README2-compatible parsing."""
+        data = self.ticker()
+        prices: Dict[str, float] = {}
+        for pair_name, ticker_data in data.items():
+            if not isinstance(ticker_data, dict):
+                continue
+            last_price = ticker_data.get("LastPrice")
+            if last_price is None:
+                continue
+            try:
+                prices[pair_name] = float(last_price)
+            except (TypeError, ValueError):
+                continue
+        return prices
+
+    def place_order(self, pair: str, side: str, quantity: float,
+                    order_type: str = "MARKET", price: float = None) -> Dict:
+        """Place order and return a flattened order dict for executor compatibility."""
+        raw = super().place_order(
+            pair=pair,
+            side=side,
+            quantity=quantity,
+            order_type=order_type,
+            price=price,
+        )
+
+        if not isinstance(raw, dict):
+            return {}
+
+        detail = raw.get("OrderDetail")
+        if not isinstance(detail, dict):
+            return raw
+
+        # Preserve legacy key access expected by executor while keeping raw fields.
+        normalized = dict(detail)
+        normalized["Success"] = raw.get("Success")
+        normalized["ErrMsg"] = raw.get("ErrMsg", "")
+        if "FilledAverPrice" not in normalized and "Price" in normalized:
+            normalized["FilledAverPrice"] = normalized.get("Price", 0)
+        return normalized
+
+    def query_orders(self, order_id: int = None, pair: str = None,
+                     pending_only: bool = False, limit: int = 100) -> List[Dict]:
+        """Return list of matched orders from README2 query payload shape."""
+        data = {"limit": limit}
+        if order_id:
+            data["order_id"] = order_id
+        elif pair:
+            data["pair"] = pair
+            if pending_only:
+                data["pending_only"] = "TRUE"
+
+        result = self._post("/v3/query_order", data)
+        if isinstance(result, dict):
+            matched = result.get("OrderMatched", [])
+            if isinstance(matched, list):
+                return matched
+        if isinstance(result, list):
+            return result
+        return []
 
 # ── Graceful shutdown ──
 _shutdown = False
@@ -64,9 +147,11 @@ def load_state() -> Dict:
             logger.warning("Failed to load state: %s", e)
     return {
         "last_rebalance": None,
+        "last_processed_bar": None,
         "rebalance_count": 0,
         "nav_history": [],
         "entry_prices": {},
+        "stop_cooldown_until": {},
         "total_trades": 0,
         "total_commission": 0.0,
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -78,6 +163,72 @@ def save_state(state: Dict):
     os.makedirs(os.path.dirname(cfg.STATE_FILE), exist_ok=True)
     with open(cfg.STATE_FILE, "w") as f:
         json.dump(state, f, indent=2, default=str)
+
+
+def _compute_average_pairwise_correlation(returns: pd.DataFrame, lookback: int = 24) -> float:
+    """Compute recent average pairwise correlation across assets."""
+    if returns is None or returns.empty:
+        return 0.0
+    if len(returns) < 2:
+        return 0.0
+
+    recent = returns.iloc[-min(lookback, len(returns)):]
+    corr = recent.corr()
+    n = len(corr)
+    if n < 2:
+        return 0.0
+
+    mask = ~np.eye(n, dtype=bool)
+    values = corr.values[mask]
+    if values.size == 0:
+        return 0.0
+    return float(np.nanmean(values))
+
+
+def _compute_composite_score(risk_summary: Dict[str, float]) -> float:
+    """Compute hackathon composite risk-adjusted score from summary metrics."""
+    sortino = float(risk_summary.get("sortino", 0.0) or 0.0)
+    sharpe = float(risk_summary.get("sharpe", 0.0) or 0.0)
+    calmar = float(risk_summary.get("calmar", 0.0) or 0.0)
+    return 0.4 * sortino + 0.3 * sharpe + 0.3 * calmar
+
+
+def _signal_consensus_count(
+    signal_scores: Dict[str, pd.Series],
+    coin: str,
+    direction: int,
+    min_abs_signal: float = 0.5,
+) -> int:
+    """Count how many component signals agree with the target direction."""
+    consensus = 0
+    for signal in signal_scores.values():
+        if coin not in signal.index:
+            continue
+        value = float(signal[coin])
+        if abs(value) < min_abs_signal:
+            continue
+        if value * direction > 0:
+            consensus += 1
+    return consensus
+
+
+def _reward_risk_ratio(
+    alpha_value: float,
+    consensus_count: int,
+    composite_score: float,
+    current_drawdown: float,
+    avg_corr: float,
+    alpha_threshold: float,
+) -> float:
+    """Reward-vs-risk score used to gate cooldown overrides."""
+    reward_quality = (
+        1.0
+        + max(0.0, composite_score)
+        + 0.20 * consensus_count
+        + 0.30 * max(0.0, abs(alpha_value) - alpha_threshold)
+    )
+    risk_pressure = 1.0 + 2.5 * max(0.0, current_drawdown) + 2.0 * max(0.0, avg_corr - 0.5)
+    return reward_quality / max(risk_pressure, 1e-9)
 
 
 # ── Logging setup ──
@@ -156,24 +307,132 @@ class TradingBot:
     """Main trading bot orchestrating all components."""
 
     def __init__(self):
-        self.client = RoostooClient()
+        self.client = RoostooSpecClient()
         self.data_engine = DataEngine()
-        self.alpha_engine = AlphaEngine()
+        live_rebalance_hours = 1 if cfg.REBALANCE.continuous_on_hour_bar else cfg.REBALANCE.frequency_hours
+        self.alpha_engine = AlphaEngine(rebalance_hours=live_rebalance_hours)
         self.optimizer = PortfolioOptimizer()
         self.executor = TradeExecutor(self.client)
         self.risk_mgr = RiskManager()
         self.state = load_state()
 
-        # Stop-loss cooldown: {coin: cycles_remaining}
-        self._stop_cooldown: Dict[str, int] = {}
-        self._STOP_COOLDOWN_CYCLES = 6  # 6 rebalance cycles = 24h cooldown
+        # Stop-loss cooldown: {coin: cooldown_expiry_utc}
+        self._stop_cooldown: Dict[str, datetime] = {}
+        for coin, expiry in self.state.get("stop_cooldown_until", {}).items():
+            try:
+                dt = datetime.fromisoformat(expiry)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                self._stop_cooldown[coin] = dt
+            except Exception:
+                continue
 
         # Restore risk manager state
         for nav in self.state.get("nav_history", []):
             self.risk_mgr.update_nav(nav)
 
-    def should_rebalance(self) -> bool:
-        """Check if enough time has passed since last rebalance."""
+    def _current_decision_bar(self) -> datetime:
+        """Return latest fully closed hourly bar timestamp in UTC."""
+        now = datetime.now(timezone.utc)
+        return now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+
+    def _refresh_cooldowns(self, now_ts: datetime):
+        """Drop expired cooldown entries."""
+        for coin in list(self._stop_cooldown):
+            if self._stop_cooldown[coin] <= now_ts:
+                del self._stop_cooldown[coin]
+
+    def _set_cooldown(self, coin: str, now_ts: datetime):
+        """Set cooldown expiry in wall-clock time."""
+        self._stop_cooldown[coin] = now_ts + timedelta(hours=cfg.OUTLIER.cooldown_hours)
+
+    def _is_on_cooldown(self, coin: str, now_ts: datetime) -> bool:
+        expiry = self._stop_cooldown.get(coin)
+        return bool(expiry and expiry > now_ts)
+
+    def _serialize_cooldowns(self) -> Dict[str, str]:
+        return {coin: dt.isoformat() for coin, dt in self._stop_cooldown.items()}
+
+    def _apply_outlier_overrides(
+        self,
+        alpha_scores: pd.Series,
+        signal_scores: Dict[str, pd.Series],
+        returns: pd.DataFrame,
+        now_ts: datetime,
+    ):
+        """Allow cooldown breaks when outlier signals have favorable reward-vs-risk."""
+        if not cfg.OUTLIER.enabled:
+            return
+
+        risk_summary = self.risk_mgr.get_risk_summary()
+        composite = _compute_composite_score(risk_summary)
+        avg_corr = _compute_average_pairwise_correlation(returns)
+        drawdown = float(self.risk_mgr.current_drawdown)
+
+        for coin in list(self._stop_cooldown):
+            if not self._is_on_cooldown(coin, now_ts):
+                continue
+            if coin not in alpha_scores.index:
+                continue
+
+            alpha_value = float(alpha_scores[coin])
+            if abs(alpha_value) < cfg.OUTLIER.alpha_z_threshold:
+                continue
+
+            direction = 1 if alpha_value > 0 else -1
+            consensus = _signal_consensus_count(signal_scores, coin, direction)
+            if consensus < cfg.OUTLIER.min_signal_consensus:
+                continue
+
+            rr_ratio = _reward_risk_ratio(
+                alpha_value=alpha_value,
+                consensus_count=consensus,
+                composite_score=composite,
+                current_drawdown=drawdown,
+                avg_corr=avg_corr,
+                alpha_threshold=cfg.OUTLIER.alpha_z_threshold,
+            )
+            if rr_ratio < cfg.OUTLIER.min_reward_risk_ratio:
+                continue
+
+            if direction > 0:
+                if drawdown > cfg.OUTLIER.max_drawdown_for_bull_override:
+                    continue
+                if avg_corr > cfg.OUTLIER.max_corr_for_bull_override:
+                    continue
+            elif (not cfg.OUTLIER.allow_bear_override_in_corr_spike
+                  and avg_corr > cfg.RISK.correlation_spike_threshold):
+                continue
+
+            del self._stop_cooldown[coin]
+            if direction < 0:
+                alpha_scores[coin] = min(alpha_scores[coin], -10.0)
+            logger.warning(
+                "Cooldown override for %s | dir=%s alpha=%.2f consensus=%d rr=%.2f dd=%.2f%% corr=%.2f",
+                coin,
+                "BULL" if direction > 0 else "BEAR",
+                alpha_value,
+                consensus,
+                rr_ratio,
+                drawdown * 100,
+                avg_corr,
+            )
+
+    def should_rebalance(self, decision_bar: Optional[datetime] = None) -> bool:
+        """Check if a new decision event is available."""
+        if cfg.REBALANCE.continuous_on_hour_bar:
+            bar = decision_bar or self._current_decision_bar()
+            last_bar_raw = self.state.get("last_processed_bar")
+            if last_bar_raw is None:
+                return True
+            try:
+                last_bar = datetime.fromisoformat(last_bar_raw)
+                if last_bar.tzinfo is None:
+                    last_bar = last_bar.replace(tzinfo=timezone.utc)
+            except Exception:
+                return True
+            return bar > last_bar
+
         last = self.state.get("last_rebalance")
         if last is None:
             return True
@@ -183,7 +442,6 @@ class TradingBot:
             last_time = last_time.replace(tzinfo=timezone.utc)
         elapsed = (datetime.now(timezone.utc) - last_time).total_seconds()
         required = cfg.REBALANCE.frequency_hours * 3600
-
         return elapsed >= required
 
     def _validate_trading_pairs(self):
@@ -233,8 +491,25 @@ class TradingBot:
             wallet = self.client.balance()
             logger.info("Wallet: %s", json.dumps(wallet, indent=2))
 
+            if not wallet:
+                try:
+                    raw_balance = self.client._get("/v3/balance", signed=True)
+                    logger.warning(
+                        "Balance endpoint returned empty parsed wallet. Raw keys=%s Success=%s ErrMsg=%s",
+                        list(raw_balance.keys()) if isinstance(raw_balance, dict) else type(raw_balance).__name__,
+                        raw_balance.get("Success") if isinstance(raw_balance, dict) else None,
+                        raw_balance.get("ErrMsg") if isinstance(raw_balance, dict) else None,
+                    )
+                except Exception as diag_err:
+                    logger.warning("Failed to fetch raw balance diagnostics: %s", diag_err)
+
             nav = self.client.get_portfolio_value()
             logger.info("Portfolio value: $%.2f", nav)
+            if nav <= 0:
+                logger.warning(
+                    "Connected successfully, but wallet appears unfunded (NAV <= 0). "
+                    "Bot will skip live trading until account has USD/coin balance."
+                )
 
             return True
         except Exception as e:
@@ -275,13 +550,14 @@ class TradingBot:
             logger.error("Failed to get status: %s", e)
             return {"error": str(e)}
 
-    def run_rebalance_cycle(self) -> Dict:
+    def run_rebalance_cycle(self, decision_bar: Optional[datetime] = None) -> Dict:
         """Execute one full rebalance cycle.
 
         Returns:
             Dict with cycle results (nav, orders, regime, etc.)
         """
-        cycle_time = datetime.now(timezone.utc).isoformat()
+        event_ts = decision_bar or datetime.now(timezone.utc)
+        cycle_time = event_ts.isoformat()
         logger.info("=" * 60)
         logger.info("Starting rebalance cycle at %s", cycle_time)
 
@@ -301,6 +577,33 @@ class TradingBot:
 
         logger.info("NAV: $%.2f | USD: $%.2f | Positions: %d",
                      nav, usd_balance, len(holdings))
+
+        if nav <= 0 or (usd_balance <= 0 and len(holdings) == 0):
+            try:
+                raw_balance = self.client._get("/v3/balance", signed=True)
+                logger.warning(
+                    "Balance diagnostics: keys=%s Success=%s ErrMsg=%s",
+                    list(raw_balance.keys()) if isinstance(raw_balance, dict) else type(raw_balance).__name__,
+                    raw_balance.get("Success") if isinstance(raw_balance, dict) else None,
+                    raw_balance.get("ErrMsg") if isinstance(raw_balance, dict) else None,
+                )
+            except Exception as diag_err:
+                logger.warning("Balance diagnostics failed: %s", diag_err)
+
+            logger.warning(
+                "No funded wallet detected (NAV=$%.2f, USD=$%.2f, positions=%d). "
+                "Skipping cycle; no orders can be sized without capital.",
+                nav,
+                usd_balance,
+                len(holdings),
+            )
+            return {
+                "status": "SKIPPED",
+                "reason": "no_funded_wallet",
+                "nav": nav,
+                "usd_balance": usd_balance,
+                "positions": len(holdings),
+            }
 
         # Update risk tracking
         self.risk_mgr.update_nav(nav)
@@ -335,18 +638,15 @@ class TradingBot:
 
         # 6. Check risk conditions
 
-        # Decrement stop-loss cooldowns
-        for coin in list(self._stop_cooldown):
-            self._stop_cooldown[coin] -= 1
-            if self._stop_cooldown[coin] <= 0:
-                del self._stop_cooldown[coin]
+        # Expire elapsed cooldowns using wall-clock time.
+        self._refresh_cooldowns(event_ts)
 
         # Widen stop-loss dynamically using ATR-based stops
         # (pass returns so RiskManager can compute per-asset realized vol)
         stop_pct = cfg.RISK.position_stop_loss_pct  # fallback only
 
         # Only check positions not on cooldown
-        check_coins = {c for c in holdings if c not in self._stop_cooldown}
+        check_coins = {c for c in holdings if not self._is_on_cooldown(c, event_ts)}
         stopped = self.risk_mgr.check_position_stops(
             {f"{c}/USD": prices.get(f"{c}/USD", 0) for c in check_coins},
             {f"{c}/USD": self.state.get("entry_prices", {}).get(c, 0) for c in check_coins},
@@ -358,13 +658,21 @@ class TradingBot:
                 coin = pair.split("/")[0]
                 if coin in alpha_scores.index:
                     alpha_scores[coin] = -10.0  # strong sell signal
-                self._stop_cooldown[coin] = self._STOP_COOLDOWN_CYCLES
+                self._set_cooldown(coin, event_ts)
                 self.risk_mgr.reset_position_hwm(coin)
 
         # Prevent re-entry for coins on cooldown
-        for coin in self._stop_cooldown:
+        for coin in list(self._stop_cooldown):
             if coin in alpha_scores.index:
                 alpha_scores[coin] = min(alpha_scores[coin], -1.0)
+
+        # Break cooldown for extreme outliers when reward-vs-risk is favorable.
+        self._apply_outlier_overrides(
+            alpha_scores=alpha_scores,
+            signal_scores=self.alpha_engine.last_signal_scores,
+            returns=returns,
+            now_ts=event_ts,
+        )
 
         # Check correlation spike (crash detection)
         if self.risk_mgr.check_correlation_spike(returns):
@@ -394,6 +702,8 @@ class TradingBot:
         if not orders:
             logger.info("No trades needed — portfolio already aligned")
             self.state["last_rebalance"] = cycle_time
+            self.state["last_processed_bar"] = event_ts.isoformat()
+            self.state["stop_cooldown_until"] = self._serialize_cooldowns()
             save_state(self.state)
             return {"status": "NO_TRADES", "nav": nav, "regime": regime_name}
 
@@ -433,11 +743,13 @@ class TradingBot:
 
         self.state.update({
             "last_rebalance": cycle_time,
+            "last_processed_bar": event_ts.isoformat(),
             "rebalance_count": self.state.get("rebalance_count", 0) + 1,
             "entry_prices": entry_prices,
             "total_trades": self.state.get("total_trades", 0) + len(filled),
             "total_commission": self.state.get("total_commission", 0) + total_commission,
             "nav_history": self.risk_mgr.nav_history[-500:],  # keep last 500
+            "stop_cooldown_until": self._serialize_cooldowns(),
         })
         save_state(self.state)
 
@@ -475,7 +787,10 @@ class TradingBot:
     def run_loop(self):
         """Main continuous trading loop."""
         logger.info("Starting trading bot — continuous mode")
-        logger.info("Rebalance frequency: every %d hours", cfg.REBALANCE.frequency_hours)
+        if cfg.REBALANCE.continuous_on_hour_bar:
+            logger.info("Decision mode: event-driven on each new closed 1h bar")
+        else:
+            logger.info("Decision mode: every %d hours", cfg.REBALANCE.frequency_hours)
 
         # Initial connectivity test + pair validation
         if not self.test_connectivity():
@@ -485,8 +800,9 @@ class TradingBot:
 
         while not _shutdown:
             try:
-                if self.should_rebalance():
-                    result = self.run_rebalance_cycle()
+                decision_bar = self._current_decision_bar()
+                if self.should_rebalance(decision_bar):
+                    result = self.run_rebalance_cycle(decision_bar=decision_bar)
                     logger.info("Cycle result: %s", result.get("status"))
                 else:
                     # Between cycles: just track NAV
@@ -501,8 +817,8 @@ class TradingBot:
             except Exception as e:
                 logger.error("Rebalance cycle failed: %s", e, exc_info=True)
 
-            # Sleep between checks (check every 5 minutes)
-            sleep_seconds = 300
+            # Sleep between event checks.
+            sleep_seconds = max(1, int(cfg.REBALANCE.poll_seconds))
             for _ in range(sleep_seconds):
                 if _shutdown:
                     break
@@ -534,10 +850,12 @@ class BacktestEngine:
         self.end = pd.Timestamp(end, tz="UTC")
         self.initial_capital = initial_capital or cfg.INITIAL_CAPITAL_USD
         self.rebalance_hours = rebalance_hours or cfg.REBALANCE.frequency_hours
+        self.continuous_mode = bool(cfg.REBALANCE.continuous_on_hour_bar and rebalance_hours is None)
+        engine_rebalance_hours = 1 if self.continuous_mode else self.rebalance_hours
 
         self.data_engine = DataEngine()
         self.alpha_engine = AlphaEngine(adaptive=adaptive,
-                                        rebalance_hours=self.rebalance_hours)
+                        rebalance_hours=engine_rebalance_hours)
         self.optimizer = PortfolioOptimizer()
         self.risk_mgr = RiskManager()
 
@@ -546,15 +864,88 @@ class BacktestEngine:
         self.holdings: Dict[str, float] = {}  # {coin: quantity}
         self.entry_prices: Dict[str, float] = {}
 
-        # Stop-loss cooldown: {coin: cycles_remaining}
-        self._stop_cooldown: Dict[str, int] = {}
-        self._STOP_COOLDOWN_CYCLES = 6  # 6 rebalance cycles = 24h cooldown
+        # Stop-loss cooldown: {coin: cooldown_expiry_utc}
+        self._stop_cooldown: Dict[str, pd.Timestamp] = {}
+        self._stop_triggered_skip_next = False  # skip next rebalance if stop fired
+
+        # 5DMA breakout addon tracking: {coin: {qty, sma_at_buy}}
+        self._sma_addon: Dict[str, Dict] = {}
+        # Track whether each coin was below 5DMA last hour (to detect crossover)
+        self._was_below_5dma: Dict[str, bool] = {}
+        # Track whether 3DMA early exit already fired (only reduce once per trend)
+        self._early_exit_fired: Dict[str, bool] = {}
 
         # Results tracking
         self.nav_series: List[Tuple[pd.Timestamp, float]] = []
         self.trade_log: List[Dict] = []
         self.portfolio_log: List[Dict] = []
         self._volume_cache: Dict[str, pd.Series] = {}  # coin -> volume series
+
+    def _refresh_cooldowns(self, now_ts: pd.Timestamp):
+        for coin in list(self._stop_cooldown):
+            if self._stop_cooldown[coin] <= now_ts:
+                del self._stop_cooldown[coin]
+
+    def _set_cooldown(self, coin: str, now_ts: pd.Timestamp):
+        self._stop_cooldown[coin] = now_ts + pd.Timedelta(hours=cfg.OUTLIER.cooldown_hours)
+
+    def _is_on_cooldown(self, coin: str, now_ts: pd.Timestamp) -> bool:
+        expiry = self._stop_cooldown.get(coin)
+        return bool(expiry is not None and expiry > now_ts)
+
+    def _apply_outlier_overrides(
+        self,
+        alpha_scores: pd.Series,
+        signal_scores: Dict[str, pd.Series],
+        returns: pd.DataFrame,
+        now_ts: pd.Timestamp,
+    ):
+        if not cfg.OUTLIER.enabled:
+            return
+
+        risk_summary = self.risk_mgr.get_risk_summary()
+        composite = _compute_composite_score(risk_summary)
+        avg_corr = _compute_average_pairwise_correlation(returns)
+        drawdown = float(self.risk_mgr.current_drawdown)
+
+        for coin in list(self._stop_cooldown):
+            if not self._is_on_cooldown(coin, now_ts):
+                continue
+            if coin not in alpha_scores.index:
+                continue
+
+            alpha_value = float(alpha_scores[coin])
+            if abs(alpha_value) < cfg.OUTLIER.alpha_z_threshold:
+                continue
+
+            direction = 1 if alpha_value > 0 else -1
+            consensus = _signal_consensus_count(signal_scores, coin, direction)
+            if consensus < cfg.OUTLIER.min_signal_consensus:
+                continue
+
+            rr_ratio = _reward_risk_ratio(
+                alpha_value=alpha_value,
+                consensus_count=consensus,
+                composite_score=composite,
+                current_drawdown=drawdown,
+                avg_corr=avg_corr,
+                alpha_threshold=cfg.OUTLIER.alpha_z_threshold,
+            )
+            if rr_ratio < cfg.OUTLIER.min_reward_risk_ratio:
+                continue
+
+            if direction > 0:
+                if drawdown > cfg.OUTLIER.max_drawdown_for_bull_override:
+                    continue
+                if avg_corr > cfg.OUTLIER.max_corr_for_bull_override:
+                    continue
+            elif (not cfg.OUTLIER.allow_bear_override_in_corr_spike
+                  and avg_corr > cfg.RISK.correlation_spike_threshold):
+                continue
+
+            del self._stop_cooldown[coin]
+            if direction < 0:
+                alpha_scores[coin] = min(alpha_scores[coin], -10.0)
 
     def _fetch_historical_range(self, coins: List[str], start: pd.Timestamp,
                                 end: pd.Timestamp, interval: str = "1h") -> pd.DataFrame:
@@ -772,6 +1163,7 @@ class BacktestEngine:
         rebalance_count = 0
         total_trades = 0
         last_rebalance_ts = None
+        continuous_mode = self.continuous_mode
 
         for i, ts in enumerate(bt_timestamps):
             # Compute NAV at every timestamp
@@ -779,6 +1171,185 @@ class BacktestEngine:
             nav = self._compute_nav(current_prices)
             self.risk_mgr.update_nav(nav)
             self.nav_series.append((ts, nav))
+
+            # ── Intra-rebalance stop-loss: check EVERY hour ──
+            if cfg.RISK.intra_stop_enabled and self.holdings:
+                stop_pct = cfg.RISK.intra_stop_loss_pct
+                stopped_coins = []
+                for coin, qty in list(self.holdings.items()):
+                    if coin in self._stop_cooldown:
+                        continue
+                    entry = self.entry_prices.get(coin)
+                    price = current_prices.get(coin, 0)
+                    if entry and price > 0:
+                        drop = (price - entry) / entry
+                        if drop <= -stop_pct:
+                            # Immediate sell
+                            proceeds = qty * price
+                            commission = proceeds * self.COMMISSION_RATE
+                            self.cash += proceeds - commission
+                            self.trade_log.append({
+                                "timestamp": str(ts),
+                                "pair": f"{coin}/USD", "side": "SELL",
+                                "quantity": qty, "price": price,
+                                "value": proceeds, "commission": commission,
+                            })
+                            stopped_coins.append(coin)
+                            total_trades += 1
+                            logger.info("  INTRA-STOP %s: entry=%.4f now=%.4f (%.1f%% drop)",
+                                        coin, entry, price, drop * 100)
+
+                for coin in stopped_coins:
+                    self.holdings.pop(coin, None)
+                    self.entry_prices.pop(coin, None)
+                    self._set_cooldown(coin, ts)
+                    self.risk_mgr.reset_position_hwm(coin)
+
+                if stopped_coins:
+                    self._stop_triggered_skip_next = True
+
+            # ── 3DMA early exit: sell 20% when price breaks below 3DMA ──
+            if cfg.RISK.sma_early_exit_enabled and self.holdings:
+                early_window = cfg.RISK.sma_early_exit_hours
+                trim_pct = cfg.RISK.sma_early_exit_pct
+                for coin, qty in list(self.holdings.items()):
+                    if coin in self._stop_cooldown:
+                        continue
+                    if self._early_exit_fired.get(coin, False):
+                        continue  # already trimmed this trend
+                    price = current_prices.get(coin, 0)
+                    if price <= 0 or coin not in close_prices.columns:
+                        continue
+                    coin_prices = close_prices.loc[:ts, coin].dropna()
+                    if len(coin_prices) < early_window:
+                        continue
+                    sma_3d = coin_prices.iloc[-early_window:].mean()
+                    if price < sma_3d:
+                        # Price broke below 3DMA — sell 20% of position
+                        sell_qty = qty * trim_pct
+                        if sell_qty * price < cfg.REBALANCE.min_trade_value_usd:
+                            continue
+                        proceeds = sell_qty * price
+                        commission = proceeds * self.COMMISSION_RATE
+                        self.cash += proceeds - commission
+                        self.holdings[coin] = qty - sell_qty
+                        self._early_exit_fired[coin] = True
+                        total_trades += 1
+                        self.trade_log.append({
+                            "timestamp": str(ts),
+                            "pair": f"{coin}/USD", "side": "SELL",
+                            "quantity": sell_qty, "price": price,
+                            "value": proceeds, "commission": commission,
+                        })
+                        logger.info("  3DMA-TRIM %s: sold 20%% ($%.0f) at %.4f < 3DMA=%.4f",
+                                    coin, proceeds, price, sma_3d)
+                    else:
+                        # Price back above 3DMA — reset so trim can fire again next break
+                        self._early_exit_fired[coin] = False
+
+            # ── 5DMA trend exit: sell ANY holding that breaks below 5DMA ──
+            if cfg.RISK.sma_profit_protect_enabled and self.holdings:
+                sma_window = cfg.RISK.sma_profit_protect_hours  # 120h = 5 days
+                sma_exits = []
+                for coin, qty in list(self.holdings.items()):
+                    if coin in self._stop_cooldown:
+                        continue
+                    price = current_prices.get(coin, 0)
+                    if price <= 0:
+                        continue
+                    # Compute 5DMA from close_prices
+                    if coin in close_prices.columns:
+                        coin_prices = close_prices.loc[:ts, coin].dropna()
+                        if len(coin_prices) >= sma_window:
+                            sma_val = coin_prices.iloc[-sma_window:].mean()
+                            if price < sma_val:
+                                # Price broke below 5DMA — sell regardless of P&L
+                                proceeds = qty * price
+                                commission = proceeds * self.COMMISSION_RATE
+                                self.cash += proceeds - commission
+                                entry = self.entry_prices.get(coin, price)
+                                pct_change = (price - entry) / entry * 100
+                                self.trade_log.append({
+                                    "timestamp": str(ts),
+                                    "pair": f"{coin}/USD", "side": "SELL",
+                                    "quantity": qty, "price": price,
+                                    "value": proceeds, "commission": commission,
+                                })
+                                sma_exits.append(coin)
+                                total_trades += 1
+                                logger.info("  5DMA-EXIT %s: entry=%.4f now=%.4f (%+.1f%%) < 5DMA=%.4f",
+                                            coin, entry, price, pct_change, sma_val)
+
+                for coin in sma_exits:
+                    self.holdings.pop(coin, None)
+                    self.entry_prices.pop(coin, None)
+                    self._sma_addon.pop(coin, None)
+                    self._was_below_5dma.pop(coin, None)
+                    self._early_exit_fired.pop(coin, None)
+
+            # ── 5DMA breakout addon: buy 20% more on crossover, sell at SMA level ──
+            if cfg.RISK.sma_addon_enabled and self.holdings:
+                sma_window = cfg.RISK.sma_profit_protect_hours
+                for coin, qty in list(self.holdings.items()):
+                    if coin in self._stop_cooldown:
+                        continue
+                    price = current_prices.get(coin, 0)
+                    if price <= 0 or coin not in close_prices.columns:
+                        continue
+                    coin_prices = close_prices.loc[:ts, coin].dropna()
+                    if len(coin_prices) < sma_window:
+                        continue
+                    sma_val = coin_prices.iloc[-sma_window:].mean()
+                    is_below = price < sma_val
+
+                    # Check for crossover: was below, now above
+                    was_below = self._was_below_5dma.get(coin, True)
+                    self._was_below_5dma[coin] = is_below
+
+                    if was_below and not is_below and coin not in self._sma_addon:
+                        # Just crossed above 5DMA — buy 20% more of current invested value
+                        invested_value = qty * price
+                        addon_value = invested_value * 0.20
+                        if addon_value >= cfg.REBALANCE.min_trade_value_usd and addon_value <= self.cash:
+                            addon_qty = addon_value / price
+                            commission = addon_value * self.COMMISSION_RATE
+                            self.cash -= (addon_value + commission)
+                            self.holdings[coin] = qty + addon_qty
+                            self._sma_addon[coin] = {"qty": addon_qty, "sma_at_buy": sma_val}
+                            total_trades += 1
+                            self.trade_log.append({
+                                "timestamp": str(ts),
+                                "pair": f"{coin}/USD", "side": "BUY",
+                                "quantity": addon_qty, "price": price,
+                                "value": addon_value, "commission": commission,
+                            })
+                            logger.info("  5DMA-ADDON BUY %s: +20%% ($%.0f) at %.4f, SMA=%.4f",
+                                        coin, addon_value, price, sma_val)
+
+                    # Check if addon should be sold: price dropped back to SMA at time of addon buy
+                    if coin in self._sma_addon:
+                        addon = self._sma_addon[coin]
+                        if price <= addon["sma_at_buy"]:
+                            # Sell just the addon portion
+                            sell_qty = min(addon["qty"], self.holdings.get(coin, 0))
+                            if sell_qty > 0:
+                                proceeds = sell_qty * price
+                                commission = proceeds * self.COMMISSION_RATE
+                                self.cash += proceeds - commission
+                                self.holdings[coin] = self.holdings.get(coin, 0) - sell_qty
+                                if self.holdings[coin] < 1e-10:
+                                    self.holdings.pop(coin, None)
+                                    self.entry_prices.pop(coin, None)
+                                total_trades += 1
+                                self.trade_log.append({
+                                    "timestamp": str(ts),
+                                    "pair": f"{coin}/USD", "side": "SELL",
+                                    "quantity": sell_qty, "price": price,
+                                    "value": proceeds, "commission": commission,
+                                })
+                                logger.info("  5DMA-ADDON SELL %s: addon at %.4f, SMA was %.4f",
+                                            coin, price, addon["sma_at_buy"])
+                            del self._sma_addon[coin]
 
             # Check if it's time to rebalance
             should_rebalance = False
@@ -790,6 +1361,28 @@ class BacktestEngine:
                     should_rebalance = True
 
             if not should_rebalance:
+                continue
+
+            # If a stop-loss fired since last rebalance, skip this one
+            if self._stop_triggered_skip_next:
+                logger.info("  [%s] Skipping rebalance — stop-loss triggered, holding until next period",
+                            ts.strftime("%Y-%m-%d %H:%M"))
+                self._stop_triggered_skip_next = False
+                last_rebalance_ts = ts
+                rebalance_count += 1
+                # Still log the snapshot
+                regime_names = {0: "BULL", 1: "NEUTRAL", 2: "BEAR"}
+                self.portfolio_log.append({
+                    "timestamp": str(ts),
+                    "nav_usd": nav,
+                    "cash_usd": self.cash,
+                    "n_positions": len(self.holdings),
+                    "invested_pct": 1 - (self.cash / nav) if nav > 0 else 0,
+                    "regime": regime_names.get(self.alpha_engine.current_regime, "UNKNOWN"),
+                    "drawdown": self.risk_mgr.current_drawdown,
+                    "max_drawdown": self.risk_mgr.max_drawdown,
+                    "n_trades": 0,
+                })
                 continue
 
             # Get lookback window for signals
@@ -818,31 +1411,38 @@ class BacktestEngine:
             if self.risk_mgr.check_correlation_spike(lookback_returns):
                 regime = 2  # force bear
 
-            # Decrement cooldowns
-            for coin in list(self._stop_cooldown):
-                self._stop_cooldown[coin] -= 1
-                if self._stop_cooldown[coin] <= 0:
-                    del self._stop_cooldown[coin]
+            # Expire elapsed cooldown windows.
+            self._refresh_cooldowns(ts)
 
             # Check position stops — ATR-based dynamic stops
             # (pass lookback_returns so RiskManager can compute per-asset vol)
             stop_pct = cfg.RISK.position_stop_loss_pct  # fallback only
-            check_prices = {coin: current_prices.get(coin, 0)
-                           for coin in self.holdings if coin not in self._stop_cooldown}
+            check_prices = {
+                coin: current_prices.get(coin, 0)
+                for coin in self.holdings
+                if not self._is_on_cooldown(coin, ts)
+            }
             stopped = self.risk_mgr.check_position_stops(
                 check_prices, self.entry_prices, stop_pct_override=stop_pct,
                 returns=lookback_returns)
             for coin in stopped:
                 if coin in alpha_scores.index:
                     alpha_scores[coin] = -10.0
-                self._stop_cooldown[coin] = self._STOP_COOLDOWN_CYCLES
+                self._set_cooldown(coin, ts)
                 # Reset HWM so re-entry starts fresh
                 self.risk_mgr.reset_position_hwm(coin)
 
             # Prevent re-entry for coins on cooldown
-            for coin in self._stop_cooldown:
+            for coin in list(self._stop_cooldown):
                 if coin in alpha_scores.index:
                     alpha_scores[coin] = min(alpha_scores[coin], -1.0)
+
+            self._apply_outlier_overrides(
+                alpha_scores=alpha_scores,
+                signal_scores=self.alpha_engine.last_signal_scores,
+                returns=lookback_returns,
+                now_ts=ts,
+            )
 
             # Optimize
             target_weights, diagnostics = self.optimizer.optimize(
